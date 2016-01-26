@@ -39,8 +39,14 @@
 #include <endian.h>
 #include <scsi/scsi.h>
 #include <errno.h>
-
+#include <hiredis/hiredis.h>
 #include "tcmu-runner.h"
+
+static redisContext *redis_ctx = NULL;
+static redisReply *redis_reply = NULL;
+static const char *redis_hostname = "localhost";
+static int redis_port = 6379;
+static uint64_t count = 0; 
 
 #ifdef ASYNC_FILE_HANDLER
 #include <pthread.h>
@@ -80,6 +86,7 @@ struct file_state {
 static int file_handle_cmd(
 	struct tcmu_device *dev,
 	struct tcmulib_cmd *tcmulib_cmd);
+
 
 static void *
 file_handler_run(void *arg)
@@ -166,8 +173,10 @@ static bool file_check_config(const char *cfgstring, char **reason)
 		asprintf(reason, "Could not create file");
 		return false;
 	}
+	printf("in file_check_config received file name is %s\n", path);
 
 	unlink(path);
+
 
 	return true;
 }
@@ -207,6 +216,7 @@ static int file_open(struct tcmu_device *dev)
 		goto err;
 	}
 	config += 1; /* get past '/' */
+	printf("in file_open received file name is %s \n", config);
 
 	state->fd = open(config, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
 	if (state->fd == -1) {
@@ -219,6 +229,18 @@ static int file_open(struct tcmu_device *dev)
 	for (i = 0; i < NHANDLERS; i++)
 		file_handler_init(&state->h[i], dev, i);
 #endif /* ASYNC_FILE_HANDLER */
+	struct timeval timeout = { 1, 500000 }; // 1.5 seconds
+	redis_ctx = redisConnectWithTimeout(redis_hostname, redis_port, timeout);
+	if (redis_ctx == NULL || redis_ctx->err) {
+		if (redis_ctx) {
+			printf("Redis Connection error: %s\n", redis_ctx->errstr);
+			redisFree(redis_ctx);
+			redis_ctx = NULL;
+		} else {
+			printf("Redis Connection error: can't allocate redis context\n");
+		}
+}
+
 
 	return 0;
 
@@ -238,8 +260,12 @@ static void file_close(struct tcmu_device *dev)
 	pthread_mutex_destroy(&state->completion_mtx);
 #endif /* ASYNC_FILE_HANDLER */
 
+	printf("in file_close received file name is %d\n", state->fd);
 	close(state->fd);
 	free(state);
+	redisFree(redis_ctx);
+	printf("Freed Redis context");
+
 }
 
 static int set_medium_error(uint8_t *sense)
@@ -285,10 +311,11 @@ static int file_handle_cmd(
 	struct file_state *state = tcmu_get_dev_private(dev);
 	uint8_t cmd;
 	int remaining;
-	size_t ret;
+	//size_t ret;
 
 	cmd = cdb[0];
 
+	//printf("in file_handle_cmd received cmd %d\n", cmd);
 	switch (cmd) {
 	case INQUIRY:
 		return tcmu_emulate_inquiry(dev, cdb, iovec, iov_cnt, sense);
@@ -317,27 +344,44 @@ static int file_handle_cmd(
 	case READ_12:
 	case READ_16:
 	{
-		void *buf;
-		uint64_t offset = state->block_size * tcmu_get_lba(cdb);
+		uint64_t lba = tcmu_get_lba(cdb);
+		uint64_t curr_lba = lba;
 		int length = tcmu_get_xfer_length(cdb) * state->block_size;
+		remaining = length;
 
 		/* Using this buf DTRT even if seek is beyond EOF */
-		buf = malloc(length);
-		if (!buf)
-			return set_medium_error(sense);
-		memset(buf, 0, length);
+		//buf = malloc(length);
+		//if (!buf)
+		//	return set_medium_error(sense);
+		//memset(buf, 0, length);
 
-		ret = pread(state->fd, buf, length, offset);
-		if (ret == -1) {
-			errp("read failed: %m\n");
-			free(buf);
-			return set_medium_error(sense);
+		//printf("in file_handle_cmd reading %d\n", length);
+		//ret = pread(state->fd, buf, length, offset);
+		//if (ret == -1) {
+		//	errp("read failed: %m\n");
+		//	free(buf);
+		//	return set_medium_error(sense);
+		//}
+		while (remaining) {
+			unsigned int to_copy;
+			to_copy = (remaining > iovec->iov_len) ? iovec->iov_len : remaining;
+			char key[256];
+			snprintf(key, 256, "%lu", curr_lba);
+			redis_reply = redisCommand(redis_ctx, "GET %s %b", key, iovec->iov_base, to_copy);
+
+			//ret = pwrite(state->fd, iovec->iov_base, to_copy, offset);
+			//if (ret == -1) {
+			//	errp("Could not write: %m\n");
+			//	return set_medium_error(sense);
+			//}
+
+			remaining -= to_copy;
+			curr_lba++;
+			iovec++;
 		}
 
-		tcmu_memcpy_into_iovec(iovec, iov_cnt, buf, length);
-
-		free(buf);
-
+		//tcmu_memcpy_into_iovec(iovec, iov_cnt, buf, length);
+		//free(buf);
 		return SAM_STAT_GOOD;
 	}
 	break;
@@ -346,24 +390,27 @@ static int file_handle_cmd(
 	case WRITE_12:
 	case WRITE_16:
 	{
-		uint64_t offset = state->block_size * tcmu_get_lba(cdb);
-		int length = be16toh(*((uint16_t *)&cdb[7])) * state->block_size;
-
+		uint64_t lba = tcmu_get_lba(cdb);
+		uint64_t curr_lba = lba;
+		int length = tcmu_get_xfer_length(cdb) * state->block_size;
 		remaining = length;
 
+		//printf("in file_handle_cmd writing %d \n", length);
 		while (remaining) {
 			unsigned int to_copy;
-
 			to_copy = (remaining > iovec->iov_len) ? iovec->iov_len : remaining;
+			char key[256];
+			snprintf(key, 256, "%lu", curr_lba);
+			redis_reply = redisCommand(redis_ctx, "SET %s %b", key, iovec->iov_base, to_copy);
 
-			ret = pwrite(state->fd, iovec->iov_base, to_copy, offset);
-			if (ret == -1) {
-				errp("Could not write: %m\n");
-				return set_medium_error(sense);
-			}
+			//ret = pwrite(state->fd, iovec->iov_base, to_copy, offset);
+			//if (ret == -1) {
+			//	errp("Could not write: %m\n");
+			//	return set_medium_error(sense);
+			//}
 
 			remaining -= to_copy;
-			offset += to_copy;
+			curr_lba++;
 			iovec++;
 		}
 
@@ -400,5 +447,7 @@ static struct tcmur_handler file_handler = {
 /* Entry point must be named "handler_init". */
 void handler_init(void)
 {
+
 	tcmur_register_handler(&file_handler);
+printf("Initialized file handler\n");
 }

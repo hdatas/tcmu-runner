@@ -1,6 +1,7 @@
 cmake_minimum_required (VERSION 3.0 FATAL_ERROR)
 project (tcmu-runner VERSION 0.9.4 LANGUAGES C)
 
+set(CMAKE_BUILD_TYPE Debug)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -std=c99")
 
 include(GNUInstallDirs)
@@ -29,6 +30,7 @@ find_library(PTHREAD pthread)
 find_library(DL dl)
 find_library(KMOD kmod)
 find_library(GFAPI gfapi)
+find_library(REDIS hiredis)
 
 # Stuff for building the shared library
 add_library(tcmu
@@ -93,6 +95,10 @@ set_target_properties(handler_file
   PREFIX ""
   )
 
+target_link_libraries(handler_file
+  ${REDIS}
+  )
+
 # Stuff for building the async file handler
 add_library(handler_file_async
   SHARED
@@ -103,7 +109,7 @@ set_target_properties(handler_file_async
   PREFIX ""
   COMPILE_FLAGS "-DASYNC_FILE_HANDLER"
   )
-target_link_libraries(handler_file_async ${PTHREAD})
+target_link_libraries(handler_file_async ${PTHREAD} ${REDIS})
 
 # The minimal library consumer
 add_executable(consumer
@@ -123,6 +129,7 @@ set_target_properties(handler_glfs
 target_link_libraries(handler_glfs
   ${GFAPI}
   )
+
 
 # Stuff for building the qcow handler
 add_library(handler_qcow
